@@ -177,14 +177,13 @@ fn maybe_create_checkpoint(env: &Env, raffle_count: u32) {
 
 /// Validate that an address is usable for a privileged role (admin/treasury).
 ///
-/// Rejects the zero address (all-zero contract id) and any other non-existent
-/// address, as well as the factory's own address to prevent a self-referential
-/// admin or treasury that would brick the contract.
+/// Rejects the zero contract address (all-zero 32-byte hash) and the factory's
+/// own address to prevent a self-referential admin or treasury that would brick
+/// the contract.  Account (keypair) addresses are always accepted.
 fn require_valid_role_address(env: &Env, address: &Address) -> Result<(), ContractError> {
-    if !address.exists() {
-        return Err(ContractError::InvalidParameters);
-    }
-    if *address == env.current_contract_address() {
+    const ZERO_CONTRACT: &str = "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABSC4";
+    let zero = Address::from_string(&soroban_sdk::String::from_str(env, ZERO_CONTRACT));
+    if *address == zero || *address == env.current_contract_address() {
         return Err(ContractError::InvalidParameters);
     }
     Ok(())
@@ -220,9 +219,7 @@ impl RaffleFactory {
         env.storage()
             .persistent()
             .set(&DataKey::Treasury, &treasury);
-        env.storage()
-            .persistent()
-            .set(&DataKey::Initialized, &true);
+        env.storage().persistent().set(&DataKey::Initialized, &true);
 
         events::FactoryInitialized {
             admin,

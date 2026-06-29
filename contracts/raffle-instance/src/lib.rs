@@ -11,8 +11,8 @@ mod events;
 mod randomness;
 
 use raffle_shared::{
-    CancelReason, FailureReason, FairnessData, RaffleConfig, RaffleStatus, RandomnessSource, RandomnessType,
-    Ticket,
+    CancelReason, FailureReason, FairnessData, RaffleConfig, RaffleStatus, RandomnessSource,
+    RandomnessType, Ticket,
 };
 
 use self::randomness::{OracleSeedWinnerSelection, WinnerSelectionStrategy};
@@ -20,9 +20,10 @@ use self::randomness::{OracleSeedWinnerSelection, WinnerSelectionStrategy};
 use crate::events::{
     ContractPaused, ContractUnpaused, DrawTriggered, EmergencyWithdrawn, FeesWithdrawn,
     OracleAddressUpdated, PrizeClaimed, PrizeDeposited, PrizeRefunded, ProtocolFeeUpdated,
-    RaffleCancelled, RaffleCreated, RaffleFinalized, RaffleFailed, RaffleStatusChanged,
-    RandomnessFallbackTriggered, RandomnessReceived, RandomnessRequested, TicketPurchased,
-    TicketRefunded, TicketSalesPaused, TicketSalesResumed, TokensRescued, WinnerDrawn,
+    RaffleCancelled, RaffleCreated, RaffleFailed, RaffleFinalized, RaffleStatusChanged,
+    RandomnessFallbackTriggered, RandomnessReceived, RandomnessRequested, SwapDeadlineUpdated,
+    TicketPurchased, TicketRefunded, TicketSalesPaused, TicketSalesResumed, TokensRescued,
+    WinnerDrawn,
 };
 
 const ORACLE_TIMEOUT_LEDGERS: u32 = 200;
@@ -109,6 +110,8 @@ pub enum DataKey {
     /// transfers: a ticket holder who committed and then transferred the
     /// ticket still has their entropy contribution recorded here.
     CommitEntry(u32),
+    /// Reentrancy guard for the drawing flow.
+    DrawingLock,
 }
 
 /// A single participant commit recorded during the commit phase of a
@@ -170,6 +173,11 @@ pub enum Error {
     InsufficientAccumulatedFees = 56,
     PrizeConfigurationLocked = 57,
     ExceedsMaxTicketsPerTx = 58,
+    DrawingAlreadyInProgress = 59,
+    InvalidStatusForDrawingTransition = 60,
+    DrawingAlreadyComplete = 61,
+    InvalidEndTime = 62,
+    InvalidAdminAddress = 63,
 }
 
 fn read_raffle(env: &Env) -> Result<Raffle, Error> {
@@ -215,6 +223,7 @@ fn acquire_guard(env: &Env) -> Result<(), Error> {
 
 // Helper to enforce slippage and deadline guards for token swaps
 // Uses the raffle's configurable swap_deadline_seconds to calculate the deadline
+#[allow(dead_code)]
 fn enforce_swap_guard(
     env: &Env,
     raffle: &Raffle,
@@ -223,7 +232,7 @@ fn enforce_swap_guard(
 ) -> Result<(), Error> {
     // Calculate deadline based on current timestamp and raffle's configured deadline window
     let deadline = env.ledger().timestamp() + raffle.swap_deadline_seconds;
-    
+
     // Check deadline
     if env.ledger().timestamp() > deadline {
         return Err(Error::DeadlinePassed);
@@ -853,16 +862,6 @@ impl Contract {
     }
 
     pub fn finalize_raffle(env: Env) -> Result<(), Error> {
-        // SECURITY: fast-path guard — if DrawingLock is true, another Drawing transition is
-        // already in progress; reject without reading further state
-        let drawing_lock: bool = env
-            .storage()
-            .instance()
-            .get(&DataKey::DrawingLock)
-            .unwrap_or(false);
-        if drawing_lock {
-            return Err(Error::DrawingAlreadyInProgress);
-        }
         let mut raffle = read_raffle(&env)?;
         raffle.creator.require_auth();
 
@@ -881,7 +880,7 @@ impl Contract {
         // #169: zero tickets sold is always a failure regardless of min_tickets,
         // ensuring the creator can recover their deposited prize via refund_prize.
         if raffle.tickets_sold == 0 || raffle.tickets_sold < raffle.min_tickets {
-            let old_status = raffle.status.clone();
+            let _old_status = raffle.status.clone();
             raffle.status = RaffleStatus::Failed;
             write_raffle(&env, &raffle);
 
@@ -904,7 +903,9 @@ impl Contract {
         let caller = raffle.creator.clone();
         let pre_drawing_status = raffle.status.clone();
 
-        transition_to_drawing(&env, &mut raffle, now)?;
+        if raffle.status != RaffleStatus::Drawing {
+            transition_to_drawing(&env, &mut raffle, now)?;
+        }
 
         if raffle.randomness_source == RandomnessSource::External {
             match request_randomness(&env) {
@@ -1925,6 +1926,7 @@ mod test {
             tikka_token: None,
             metadata_hash: BytesN::from_array(&env, &[1u8; 32]),
             claim_lockup_seconds: 0, // => DEFAULT_CLAIM_LOCKUP_SECONDS (3600)
+            swap_deadline_seconds: 0,
         };
 
         client.init(&factory, &admin, &creator, &config);
@@ -1985,6 +1987,7 @@ mod test {
             tikka_token: None,
             metadata_hash: BytesN::from_array(&env, &[5u8; 32]),
             claim_lockup_seconds: 0,
+            swap_deadline_seconds: 0,
         };
 
         client.init(&factory, &admin, &creator, &config);
@@ -2040,6 +2043,7 @@ mod test {
             tikka_token: None,
             metadata_hash: BytesN::from_array(env, &[7u8; 32]),
             claim_lockup_seconds: 0,
+            swap_deadline_seconds: 0,
         };
 
         client.init(&factory, &admin, &creator, &config);
